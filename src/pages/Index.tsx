@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useCollection } from '@/hooks/use-collection'
 import { useAuth } from '@/hooks/use-auth'
 import { MetricCard } from '@/components/ui-helpers'
@@ -109,10 +109,9 @@ export default function Index() {
     }
   }, [])
 
-  useState(() => {
+  useEffect(() => {
     fetchIndicadores()
-    return undefined
-  })
+  }, [fetchIndicadores])
 
   const handleIndicadorUpdate = useCallback(async (id: string, valor: number) => {
     try {

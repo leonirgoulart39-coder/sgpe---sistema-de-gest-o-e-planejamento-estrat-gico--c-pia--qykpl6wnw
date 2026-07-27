@@ -13,6 +13,11 @@ export function useCollection<T extends RecordModel = RecordModel>(
   const [error, setError] = useState<Error | null>(null)
 
   const fetchData = useCallback(async () => {
+    if (!pb.authStore.isValid) {
+      setLoading(false)
+      setItems([])
+      return
+    }
     try {
       setLoading(true)
       const records = await pb.collection(collectionName).getFullList<T>({
@@ -35,7 +40,9 @@ export function useCollection<T extends RecordModel = RecordModel>(
   }, [fetchData])
 
   useRealtime<T>(collectionName, () => {
-    fetchData()
+    if (pb.authStore.isValid) {
+      fetchData()
+    }
   })
 
   return { items, loading, error, refetch: fetchData }
