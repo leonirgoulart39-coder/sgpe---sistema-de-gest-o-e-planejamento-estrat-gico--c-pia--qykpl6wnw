@@ -13,7 +13,7 @@ export default function Login() {
   const [errorType, setErrorType] = useState<'generic' | 'inactive' | 'network'>('generic')
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({})
   const [loading, setLoading] = useState(false)
-  const { signIn } = useAuth()
+  const { signIn, signInWith } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
   const from = (location.state as { from?: { pathname?: string } })?.from?.pathname || '/'
@@ -150,6 +150,44 @@ export default function Login() {
             )}
           </Button>
         </form>
+
+        <div className="relative my-6">
+          <div className="absolute inset-0 flex items-center">
+            <span className="w-full border-t border-border" />
+          </div>
+          <div className="relative flex justify-center text-xs">
+            <span className="bg-card px-2 text-muted-foreground font-sans">ou</span>
+          </div>
+        </div>
+
+        <Button
+          type="button"
+          variant="outline"
+          className="w-full"
+          disabled={loading}
+          onClick={async () => {
+            setErrorMsg('')
+            setFieldErrors({})
+            setLoading(true)
+            const { error } = await signInWith('google')
+            setLoading(false)
+            if (error) {
+              const status = (error as any)?.status || 0
+              if (status === 0) {
+                setErrorType('network')
+                setErrorMsg('Erro de conexão. Verifique sua internet e tente novamente.')
+              } else {
+                setErrorType('generic')
+                setErrorMsg(getErrorMessage(error) || 'Não foi possível autenticar com Google.')
+              }
+            } else {
+              navigate(from, { replace: true })
+            }
+          }}
+        >
+          <img src="https://img.usecurling.com/i?q=google" alt="Google" className="w-4 h-4" />
+          <span>Entrar com Google</span>
+        </Button>
 
         <div className="mt-8 pt-4 border-t border-border text-center">
           <p className="text-[11px] text-muted-foreground font-sans">

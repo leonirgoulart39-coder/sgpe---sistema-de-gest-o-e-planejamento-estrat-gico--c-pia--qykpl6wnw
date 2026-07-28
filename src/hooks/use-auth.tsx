@@ -1,73 +1,28 @@
-import { createContext, useContext, useEffect, useState, ReactNode, useCallback } from 'react'
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  ReactNode,
+  useCallback,
+  useRef,
+} from 'react'
+import { useNavigate } from 'react-router-dom'
 import pb from '@/lib/pocketbase/client'
 import { useRealtime } from '@/hooks/use-realtime'
+import {
+  isTokenExpired,
+  clearStaleAuthTokens,
+  clearAuthData,
+  withTimeout,
+  fetchUserProfileWithRetry,
+  installAuthInterceptor,
+} from '@/lib/pocketbase/auth-utils'
 import type { Role, UserProfile } from '@/types'
 
-const AUTH_STORAGE_KEY = 'pocketbase_auth'
-const PB_URL_TRACKER_KEY = 'pb_last_known_url'
-const REFRESH_TIMEOUT_MS = 8000
-const PROFILE_RETRY_DELAY_MS = 1000
-const PROFILE_MAX_RETRIES = 2
-
-function clearStaleAuthTokens() {
-  const currentUrl = import.meta.env.VITE_POCKETBASE_URL || ''
-  const lastKnownUrl = (() => {
-    try {
-      return localStorage.getItem(PB_URL_TRACKER_KEY) || ''
-    } catch {
-      return ''
-    }
-  })()
-
-  if (currentUrl && lastKnownUrl && lastKnownUrl !== currentUrl) {
-    try {
-      localStorage.removeItem(AUTH_STORAGE_KEY)
-      pb.authStore.clear()
-    } catch {
-      // ignore
-    }
-  }
-
-  if (currentUrl) {
-    try {
-      localStorage.setItem(PB_URL_TRACKER_KEY, currentUrl)
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error('authRefresh timeout')), ms)),
-  ])
-}
-
-async function fetchUserProfileWithRetry(
-  userId: string,
-): Promise<{ profile: UserProfile | null; role: Role; profileMissing: boolean }> {
-  if (!userId) return { profile: null, role: 'leitura', profileMissing: false }
-
-  for (let attempt = 0; attempt <= PROFILE_MAX_RETRIES; attempt++) {
-    try {
-      const profile = await pb
-        .collection('user_profiles')
-        .getFirstListItem<UserProfile>(`user_id = "${userId}"`)
-      return {
-        profile: profile || null,
-        role: (profile?.role || 'leitura') as Role,
-        profileMissing: false,
-      }
-    } catch {
-      if (attempt < PROFILE_MAX_RETRIES) {
-        await new Promise((resolve) => setTimeout(resolve, PROFILE_RETRY_DELAY_MS))
-      }
-    }
-  }
-
-  return { profile: null, role: 'leitura', profileMissing: true }
-}
+const REFRESH_TIMEOUT_MS = 3000
+const TOKEN_CHECK_INTERVAL_MS = 10000
+const SESSION_EXPIRY_REDIRECT_MS = 500
 
 interface AuthContextType {
   user: any
@@ -77,6 +32,7 @@ interface AuthContextType {
   isAuthenticated: boolean
   signUp: (email: string, password: string) => Promise<{ error: any }>
   signIn: (email: string, password: string) => Promise<{ error: any }>
+  signInWith: (provider: string) => Promise<{ error: any }>
   signOut: () => void
   refreshProfile: () => Promise<void>
   loading: boolean
@@ -85,12 +41,12 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
 
 export const useAuth = () => {
-  const context = useContext(AuthContext)
-  if (!context) throw new Error('useAuth must be used within an AuthProvider')
-  return context
+  const ctx = useContext(AuthContext)
+  if (!ctx) throw new Error('useAuth must be used within an AuthProvider')
+  return ctx
 }
 
-function getInitialUser(): any {
+const getInitialUser = () => {
   try {
     return pb.authStore.isValid ? pb.authStore.record : null
   } catch {
@@ -98,7 +54,7 @@ function getInitialUser(): any {
   }
 }
 
-function getInitialAuth(): boolean {
+const getInitialAuth = () => {
   try {
     return pb.authStore.isValid
   } catch {
@@ -107,24 +63,56 @@ function getInitialAuth(): boolean {
 }
 
 export const AuthProvider = ({ children }: { children: ReactNode }) => {
+  const navigate = useNavigate()
   const [user, setUser] = useState<any>(getInitialUser)
   const [profile, setProfile] = useState<UserProfile | null>(null)
   const [role, setRole] = useState<Role>('leitura')
   const [profileMissing, setProfileMissing] = useState(false)
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(getInitialAuth)
   const [loading, setLoading] = useState(true)
+  const redirectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const clearAuthState = useCallback(() => {
+    clearAuthData()
+    setUser(null)
+    setProfile(null)
+    setProfileMissing(false)
+    setIsAuthenticated(false)
+    setRole('leitura')
+  }, [])
+
+  const redirectToLogin = useCallback(() => {
+    clearAuthState()
+    navigate('/login', { replace: true })
+  }, [navigate, clearAuthState])
+
+  useEffect(() => {
+    installAuthInterceptor(() => {
+      if (redirectTimerRef.current) return
+      redirectTimerRef.current = setTimeout(() => {
+        redirectTimerRef.current = null
+        redirectToLogin()
+      }, SESSION_EXPIRY_REDIRECT_MS)
+    })
+  }, [redirectToLogin])
+
+  useEffect(() => {
+    if (!isAuthenticated) return
+    const interval = setInterval(() => {
+      if (isTokenExpired()) redirectToLogin()
+    }, TOKEN_CHECK_INTERVAL_MS)
+    return () => clearInterval(interval)
+  }, [isAuthenticated, redirectToLogin])
 
   const loadProfile = useCallback(async (userId: string) => {
-    const result = await fetchUserProfileWithRetry(userId)
-    setProfile(result.profile)
-    setRole(result.role)
-    setProfileMissing(result.profileMissing)
+    const r = await fetchUserProfileWithRetry(userId)
+    setProfile(r.profile)
+    setRole(r.role)
+    setProfileMissing(r.profileMissing)
   }, [])
 
   const refreshProfile = useCallback(async () => {
-    if (user?.id) {
-      await loadProfile(user.id)
-    }
+    if (user?.id) await loadProfile(user.id)
   }, [user?.id, loadProfile])
 
   useRealtime<UserProfile>(
@@ -147,8 +135,20 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   useEffect(() => {
     let cancelled = false
-
     clearStaleAuthTokens()
+
+    const handleAuthFailure = () => {
+      if (cancelled) return
+      clearAuthState()
+      setLoading(false)
+    }
+
+    if (pb.authStore.isValid && isTokenExpired()) {
+      handleAuthFailure()
+      return () => {
+        cancelled = true
+      }
+    }
 
     if (!pb.authStore.isValid) {
       setUser(null)
@@ -176,47 +176,21 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       withTimeout(pb.collection('users').authRefresh(), REFRESH_TIMEOUT_MS)
         .then(async () => {
           if (cancelled) return
-          const ativoRaw = pb.authStore.record?.get('ativo')
-          const isAtivo = ativoRaw !== false
-          if (!isAtivo) {
-            pb.authStore.clear()
-            localStorage.removeItem(AUTH_STORAGE_KEY)
-            setUser(null)
-            setProfile(null)
-            setProfileMissing(false)
-            setIsAuthenticated(false)
-            setRole('leitura')
+          if (pb.authStore.record?.get('ativo') === false) {
+            handleAuthFailure()
             return
           }
           setUser(pb.authStore.record)
           setIsAuthenticated(pb.authStore.isValid)
-          if (pb.authStore.record?.id) {
-            await loadProfile(pb.authStore.record.id)
-          }
+          if (pb.authStore.record?.id) await loadProfile(pb.authStore.record.id)
         })
-        .catch(() => {
-          if (cancelled) return
-          try {
-            pb.authStore.clear()
-            localStorage.removeItem(AUTH_STORAGE_KEY)
-          } catch {
-            // ignore
-          }
-          setUser(null)
-          setProfile(null)
-          setProfileMissing(false)
-          setIsAuthenticated(false)
-          setRole('leitura')
-        })
+        .catch(() => handleAuthFailure())
         .finally(() => {
           if (!cancelled) setLoading(false)
         })
     } else {
       try {
-        if (pb.authStore.record) {
-          pb.authStore.clear()
-          localStorage.removeItem(AUTH_STORAGE_KEY)
-        }
+        if (pb.authStore.record) pb.authStore.clear()
       } catch {
         // ignore
       }
@@ -232,7 +206,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       cancelled = true
       unsubscribe()
     }
-  }, [loadProfile])
+  }, [loadProfile, clearAuthState])
 
   const signUp = async (email: string, password: string) => {
     try {
@@ -258,11 +232,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const signIn = async (email: string, password: string) => {
     try {
       await pb.collection('users').authWithPassword(email, password)
-      const ativoRaw = pb.authStore.record?.get('ativo')
-      const isAtivo = ativoRaw !== false
-      if (!isAtivo) {
-        pb.authStore.clear()
-        localStorage.removeItem(AUTH_STORAGE_KEY)
+      if (pb.authStore.record?.get('ativo') === false) {
+        clearAuthData()
         return { error: { message: 'Usuário inativo' } }
       }
       if (pb.authStore.record?.id) {
@@ -276,18 +247,21 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     }
   }
 
-  const signOut = () => {
+  const signInWith = async (provider: string) => {
     try {
-      pb.authStore.clear()
-    } catch {
-      // ignore
+      await pb.collection('users').authWithOAuth2({ provider })
+      if (pb.authStore.record?.id) {
+        setUser(pb.authStore.record)
+        setIsAuthenticated(true)
+        await loadProfile(pb.authStore.record.id)
+      }
+      return { error: null }
+    } catch (error) {
+      return { error }
     }
-    setUser(null)
-    setProfile(null)
-    setProfileMissing(false)
-    setIsAuthenticated(false)
-    setRole('leitura')
   }
+
+  const signOut = () => clearAuthState()
 
   return (
     <AuthContext.Provider
@@ -299,6 +273,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         isAuthenticated,
         signUp,
         signIn,
+        signInWith,
         signOut,
         refreshProfile,
         loading,
